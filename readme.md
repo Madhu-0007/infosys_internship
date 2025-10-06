@@ -18,8 +18,6 @@ and **query documents using Retrieval-Augmented Generation (RAG)** — all in on
   Compare multiple brands on pricing, ratings, discounts, and more.
 - **Strategic Recommendations**  
   Auto-generated insights for competitive positioning.
-- **Document Q&A (RAG Module)**  
-  Query `.txt`, `.pdf`, `.csv`, or `.md` documents using Google GenAI and Groq LLaMA 3.
 - **Email Alerts**  
   Receive notifications for significant competitor changes or events.
 

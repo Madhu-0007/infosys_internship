@@ -51,7 +51,7 @@ infosys_internship/
 ├── out/
 ├── ingestion.py
 ├── main.py
-├── model.py
+├── dashboard.py
 ├── notification.py
 ├── products.py
 ├── rag.py

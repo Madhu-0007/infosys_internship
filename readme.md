@@ -99,7 +99,7 @@ infosys_internship/
 1. **Run the main dashboard**
 
    ```bash
-   python main.py
+   streamlit run dashboard.py
    ```
 
 2. **Document Q&A (RAG)**

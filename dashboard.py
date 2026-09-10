@@ -1,398 +1,391 @@
-import os
-import sys
-import shutil
-import subprocess
-import time
+"""
+dashboard.py — Ground-up Dark Trading Terminal E-Commerce Competitor Price Tracker.
+Flipkart vs Amazon Direct Intelligence Engine.
+
+Refactored Architecture:
+- core/ : Pure business logic, typed domain models, Holt-Winters forecasting, sentiment extraction, and data loaders.
+- ui/   : High-performance terminal styles, Plotly charts, topbars, KPI cards, product cards, and detail views.
+- tests/: Comprehensive unit test suite with high coverage across models, classification, and forecasting.
+"""
+import datetime
+import logging
+from typing import Dict, List, Optional, Tuple
+
 import pandas as pd
 import streamlit as st
-import plotly.express as px
-import numpy as np
-from textblob import TextBlob
-import joblib
 
-# ---------------- Streamlit Page Config ----------------
-st.set_page_config(
-    page_title="E-Commerce Competitor Strategy Dashboard",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
+from matcher import extract_brand
+from core import (
+    ProductItem,
+    CompetitorPair,
+    _APPLIANCE_TYPE_RULES,
+    get_appliance_type,
+    get_department_name,
+    canonical_brand_name,
+    normalize_str,
+    normalize_category,
+    product_matches_query,
+    reset_and_initialize_price_history,
+    startup_category_audit,
+    load_all_market_data,
+    scrape_and_index_new_product,
+)
+from ui import (
+    inject_terminal_css,
+    render_topbar,
+    render_controls_and_drilldown,
+    render_kpi_strip,
+    render_price_drop_feed,
+    render_product_card,
+    render_product_detail_view,
+    safe_button,
 )
 
-# ---------------- Custom Styling ----------------
-st.markdown("""
-<style>
-.main-header {font-size:2.3rem;color:#1f77b4;text-align:center;margin-bottom:1rem;}
-.section-header {font-size:1.6rem;color:#2e86ab;margin-top:2rem;margin-bottom:1rem;}
-.positive-sentiment { color:#28a745; }
-.negative-sentiment { color:#dc3545; }
-.neutral-sentiment  { color:#ffc107; }
-</style>
-""", unsafe_allow_html=True)
+logger = logging.getLogger("CompetitorTracker")
+
+# -----------------------------------------------------------------------------
+# 1. Page Configuration & Terminal Theme Injection
+# -----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="COMP-TERMINAL // Competitor Price Intelligence",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+inject_terminal_css()
 
 
-# ---------------- Orchestration (Scrape → Ingest → Notify) ----------------
-def rotate_snapshots():
-    """Copy today's CSVs to yesterday snapshots for diff-based notifications."""
-    try:
-        os.makedirs("my_docs", exist_ok=True)
-        src_dst_pairs = [
-            ("my_docs/mobile.csv", "my_docs/mobile_yesterday.csv"),
-            ("my_docs/review.csv", "my_docs/review_yesterday.csv"),
+# -----------------------------------------------------------------------------
+# 2. Startup Cache & Sanitizers (Run once per server instance)
+# -----------------------------------------------------------------------------
+@st.cache_resource
+def _run_startup_sanitizer():
+    """Runs once per server startup to sanitize URLs and clean legacy paths."""
+    reset_and_initialize_price_history()
+    return True
+
+
+@st.cache_resource
+def _run_startup_audit():
+    """Runs once per server startup to audit available categories and brands."""
+    return startup_category_audit()
+
+
+reset_and_initialize_price_history()
+_run_startup_audit()
+
+
+
+# -----------------------------------------------------------------------------
+# 3. Main Dashboard Controller
+# -----------------------------------------------------------------------------
+def main():
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    # Top Status Bar
+    render_topbar(now_str)
+
+    # Initial data load for global controls
+    if "selected_cat_label" not in st.session_state:
+        st.session_state["selected_cat_label"] = "All Categories"
+
+    category_slug_map = {
+        "All Categories": "all",
+        "Mobiles": "mobiles",
+        "Laptops": "laptops",
+        "Home Appliances": "home_appliances",
+    }
+    current_cat_slug = category_slug_map.get(st.session_state["selected_cat_label"], "all")
+    df_for_controls = load_all_market_data(selected_category=current_cat_slug)
+    fk_df_all = df_for_controls[df_for_controls["source"] == "flipkart"].copy()
+
+    # Render Controls & Dynamic Drilldown
+    (
+        search_query,
+        selected_category,
+        selected_cat_label,
+        show_watchlist_only,
+        selected_drilldown_brands,
+        selected_drilldown_types,
+    ) = render_controls_and_drilldown(fk_df_all)
+
+    is_single_category = selected_category != "all"
+
+    # Active dataset and Amazon pairing
+    df_global = load_all_market_data(selected_category="all")
+    fk_df_global = df_global[df_global["source"] == "flipkart"].copy()
+    az_df_global = df_global[df_global["source"] == "amazon"].copy()
+
+    df_cat = load_all_market_data(selected_category=selected_category)
+    fk_df_cat = df_cat[df_cat["source"] == "flipkart"].copy()
+    az_df_cat = df_cat[df_cat["source"] == "amazon"].copy()
+
+    searched_cross_category = False
+    if search_query:
+        cat_matches = [
+            r for _, r in fk_df_cat.iterrows()
+            if product_matches_query(
+                r["product_name"],
+                extract_brand(r["product_name"]),
+                normalize_str(extract_brand(r["product_name"])),
+                r.get("category", selected_category),
+                search_query,
+            )
         ]
-        for src, dst in src_dst_pairs:
-            if os.path.exists(src):
-                shutil.copyfile(src, dst)
-    except Exception as e:
-        st.warning(f"Snapshot rotation issue: {e}")
+        if is_single_category and not cat_matches:
+            active_fk_df = fk_df_global
+            active_az_df = az_df_global
+            searched_cross_category = True
+        else:
+            active_fk_df = fk_df_cat
+            active_az_df = az_df_cat
+    else:
+        active_fk_df = fk_df_cat
+        active_az_df = az_df_cat
 
+    # Prompt user if single category is selected without selecting any drilldown item
+    if is_single_category and not search_query:
+        if selected_category == "home_appliances" and not selected_drilldown_types:
+            st.info(f"👉 Select at least one appliance category (e.g. AC, Fridge, Washing Machine) from the drill-down above to view {selected_cat_label} products.")
+            return
+        elif selected_category != "home_appliances" and not selected_drilldown_brands:
+            st.info(f"👉 Select at least one brand from the brand drill-down above to view {selected_cat_label} products.")
+            return
 
-def run_script(path):
-    """Run a Python script with the current interpreter; surface concise errors."""
-    try:
-        subprocess.run([sys.executable, path], check=True)
-    except subprocess.CalledProcessError as e:
-        st.error(f"Failed running {path}: {e}")
-        raise
+    # Filter product pairs
+    filtered_pairs: List[Tuple[pd.Series, Optional[pd.Series]]] = []
+    for _, fk_row in active_fk_df.iterrows():
+        p_name = fk_row["product_name"]
+        b_raw = extract_brand(p_name)
+        b_norm = normalize_str(b_raw)
+        row_cat = fk_row.get("category", selected_category)
 
+        if show_watchlist_only and p_name not in st.session_state["watchlist"]:
+            continue
 
-def trigger_notifications():
-    print("DEBUG: trigger_notifications called from dashboard!")
-    try:
-        import notification as notif
-        sent_notification_ids = notif.get_sent_notification_ids()
-        notif.check_price_drops(sent_notification_ids)
-        notif.check_negative_reviews(sent_notification_ids)
-        notif.send_test_notification(lambda msg: st.info(msg))  # Show result in Streamlit UI
-        st.info("Notifications logic executed. Check console for debug output.")
-    except Exception as e:
-        import traceback
-        st.error(f"Notifications step encountered an issue: {e}\n{traceback.format_exc()}")
-
-
-def orchestrate_pipeline():
-    with st.spinner("🔄 Starting pipeline..."):
-        # Step 1: Scraping
-        st.info("Step 1: Scraping product and review data...")
-        rotate_snapshots()
-        run_script("product.py")
-        st.success("✅ Scraping complete.")
-
-        # Step 2: Ingestion and ML model training
-        st.info("Step 2: Data ingestion, cleaning, and ML model training...")
-        run_script("ingestion.py")
-        st.success("✅ Ingestion and ML model training complete.")
-
-        # Step 3: Sentiment analysis
-        st.info("Step 3: Sentiment analysis using OpenAI...")
-        run_script("sentiment.py")
-        st.success("✅ Sentiment analysis complete.")
-
-        # Step 4: Notifications
-        st.info("Step 4: Running notifications (price drops, negative reviews)...")
-        time.sleep(0.5)
-        trigger_notifications()
-        st.success("✅ Notifications sent.")
-
-        # Step 5: Dashboard will be displayed after login
-        st.info("Step 5: Dashboard ready. Please log in to continue.")
-
-
-# ---------------- Competitor Analyzer ----------------
-class CompetitorAnalyzer:
-    def __init__(self):
-        self.products_df = None
-        self.reviews_df = None
-
-    def load_data(self,
-                  products_file="data/cleaned_mobile.csv",
-                  reviews_file="reviews_with_sentiment.csv") -> bool:
-        """Load cleaned product & review datasets, apply schema normalization."""
-        try:
-            # Load product data
-            if os.path.exists(products_file):
-                self.products_df = pd.read_csv(products_file)
-                self.products_df.rename(columns={
-                    "mobilename": "product_name",
-                    "sellingprice": "price",
-                    "discountoffering": "discount",
-                    "rating": "rating",
-                    "productid": "product_id",
-                    "source": "source"
-                }, inplace=True)
+        if not search_query and is_single_category:
+            if selected_category == "home_appliances":
+                if selected_drilldown_types:
+                    p_atype = get_appliance_type(p_name)
+                    if p_atype not in selected_drilldown_types:
+                        continue
             else:
-                st.error(f"Missing {products_file}")
-                return False
+                if selected_drilldown_brands and (b_norm not in selected_drilldown_brands):
+                    continue
 
-            # Load review data (with OpenAI sentiment)
-            if os.path.exists(reviews_file):
-                self.reviews_df = pd.read_csv(reviews_file)
-                self.reviews_df.rename(columns={
-                    "mobilename": "product_name",
-                    "review": "review_text",
-                    "rating": "rating",
-                    "reviewdate": "date",
-                    "productid": "product_id",
-                    "source": "source"
-                }, inplace=True)
-            else:
-                st.error(f"Missing {reviews_file}")
-                return False
+        if search_query:
+            if not product_matches_query(p_name, b_raw, b_norm, row_cat, search_query):
+                continue
 
-            # Convert data types
-            self.products_df["price"] = pd.to_numeric(
-                self.products_df["price"], errors="coerce")
-            self.products_df["discount"] = pd.to_numeric(
-                self.products_df["discount"], errors="coerce").fillna(0)
-            self.products_df["rating"] = pd.to_numeric(
-                self.products_df["rating"], errors="coerce").fillna(0)
-            self.reviews_df["date"] = pd.to_datetime(
-                self.reviews_df["date"], errors="coerce")
+        m_id = fk_row.get("matched_id")
+        az_match = active_az_df[active_az_df["matched_id"] == m_id] if m_id and pd.notna(m_id) else pd.DataFrame()
+        if az_match.empty:
+            az_match = active_az_df[active_az_df["product_name"] == p_name]
 
-            return True
-        except Exception as e:
-            st.error(f"Error loading data: {e}")
-            return False
+        az_row = az_match.iloc[0] if not az_match.empty else None
+        filtered_pairs.append((fk_row, az_row))
 
-    # ---------- Sentiment Analysis (OpenAI labels) ----------
-    def get_sentiment_analysis(self, product_name):
-        """Return sentiment distribution for a given product using OpenAI labels."""
-        df = self.reviews_df[self.reviews_df["product_name"] == product_name].copy()
-        if df.empty or "sentiment" not in df.columns:
-            return None
+    # Detail View Check
+    if "selected_product" not in st.session_state:
+        st.session_state["selected_product"] = None
 
-        # Map sentiment to scores for average calculation
-        sentiment_map = {"Positive": 1, "Neutral": 0, "Negative": -1,
-                         "positive": 1, "neutral": 0, "negative": -1}
-        df["sentiment_score"] = df["sentiment"].map(sentiment_map).fillna(0)
+    prev_search = st.session_state.get("_prev_search_query", "")
+    if search_query != prev_search:
+        if st.session_state.get("selected_product") and search_query:
+            st.session_state["selected_product"] = None
+        st.session_state["_prev_search_query"] = search_query
 
-        return {
-            "total_reviews": len(df),
-            "sentiment_distribution": df["sentiment"].value_counts().to_dict(),
-            "average_sentiment_score": df["sentiment_score"].mean(),
-            "reviews_data": df
-        }
+    if st.session_state["selected_product"]:
+        sel_name = st.session_state["selected_product"]
+        sel_pair = next((pair for pair in filtered_pairs if pair[0]["product_name"] == sel_name), None)
+        if sel_pair:
+            render_product_detail_view(sel_name, sel_pair[0], sel_pair[1], selected_category)
+            return
 
+    # Render Trading KPIs Strip
+    render_kpi_strip(filtered_pairs, selected_category)
 
-# Move ML prediction function outside the class
-def predict_price_lgbm(discount, rating):
-    try:
-        import pandas as pd
-        model = joblib.load("data/price_predictor_lgbm.joblib")
-        X_new = pd.DataFrame([[discount, rating]], columns=["discountoffering", "rating"])
-        pred = model.predict(X_new)[0]
-        return round(pred, 2)
-    except Exception as e:
-        st.warning(f"ML prediction error: {e}")
-        return None
+    # Render Price Drop Feed
+    render_price_drop_feed(filtered_pairs, selected_category)
 
+    # Cross-Category Match Notification
+    if searched_cross_category and filtered_pairs:
+        st.info(f"💡 No direct matches found within '{selected_cat_label}', but found {len(filtered_pairs)} matching products across other departments:")
 
-# ---------------- Dashboard Sections ----------------
-def product_analysis(analyzer, product_name):
-    st.info(f"🔍 Showing analysis for: {product_name}")
-    df = analyzer.products_df[analyzer.products_df["product_name"] == product_name]
-    if df.empty:
-        st.warning("No data available for this product.")
+    # Empty State & On-Demand Live Indexer
+    if not filtered_pairs:
+        if search_query:
+            auto_key = f"auto_scraped_{normalize_str(search_query)}"
+            if not st.session_state.get(auto_key, False):
+                _known_brands = {
+                    "apple", "samsung", "xiaomi", "redmi", "realme", "oneplus", "vivo",
+                    "oppo", "poco", "motorola", "nokia", "iqoo", "nothing", "cmf",
+                    "honor", "infinix", "google", "pixel", "lg", "hp", "dell", "lenovo",
+                    "asus", "acer", "msi", "sony", "whirlpool", "bosch", "ifb", "voltas",
+                    "daikin", "godrej", "haier", "hitachi", "panasonic", "carrier",
+                    "philips", "havells", "bajaj", "crompton", "usha", "kent", "aquaguard",
+                    "iphone", "galaxy", "macbook", "ipad",
+                }
+                _product_kws = {
+                    "phone", "mobile", "smartphone", "laptop", "tablet", "tv", "ac",
+                    "fridge", "washing", "microwave", "purifier", "geyser", "fan",
+                    "camera", "earphone", "headphone", "watch", "speaker", "router",
+                    "monitor", "keyboard", "mouse", "printer", "projector", "vacuum",
+                    "refrigerator", "dishwasher", "oven", "cooler", "heater", "blender",
+                    "gb", "tb", "ram", "ssd", "hdd", "5g", "4g", "pro", "max", "ultra",
+                    "plus", "lite", "mini", "gen", "series", "edition", "inch", "hz",
+                    "inverter", "ton", "door", "star", "rpm", "litre", "watt",
+                }
+                sq_tokens = set(normalize_str(search_query).split())
+                is_meaningful = (
+                    len(sq_tokens) >= 2
+                    or bool(sq_tokens & _known_brands)
+                    or bool(sq_tokens & _product_kws)
+                )
+
+                if is_meaningful:
+                    st.session_state[auto_key] = True
+                    with st.spinner(f'🔍 "{search_query}" not in catalog — estimating prices from market data...'):
+                        success, product_name = scrape_and_index_new_product(search_query, selected_category)
+                        if success:
+                            st.toast(f'✅ Indexed "{product_name}" with estimated market pricing', icon="🚀")
+                            st.cache_data.clear()
+                            st.rerun()
+                else:
+                    st.session_state[auto_key] = True
+
+            st.markdown(
+                f"""
+            <div style='background:#161b22; border:1px dashed #f59e0b; border-radius:8px; padding:1.6rem; text-align:center; margin:1.5rem 0;'>
+                <div style='font-size:1.8rem; margin-bottom:0.4rem;'>⚡</div>
+                <div class='mono' style='font-size:1.15rem; font-weight:800; color:#f0f6fc; margin-bottom:0.4rem;'>
+                    NO TRACKED LISTINGS FOUND FOR: "{search_query}"
+                </div>
+                <div style='font-size:0.86rem; color:#8b949e; max-width:620px; margin:0 auto 1.2rem auto; line-height:1.4;'>
+                    Live scraping did not find verified dual-platform matches for this search query.
+                    Try searching with specific brand or model keywords.
+                </div>
+            </div>
+            """,
+                unsafe_allow_html=True,
+            )
+            col_sc1, col_sc2, col_sc3 = st.columns([1, 1.8, 1])
+            with col_sc2:
+                if safe_button(
+                    f"🔄 Force Re-Scrape \"{search_query}\" Across Flipkart & Amazon",
+                    key="btn_force_rescrape",
+                    stretch=True,
+                ):
+                    st.session_state[auto_key] = False
+                    st.cache_data.clear()
+                    st.rerun()
+        else:
+            st.info("No products match the selected criteria.")
         return
 
-    # Show predicted price at the top
-    prod = df.iloc[0]
-    discount = prod["discount"]
-    rating = prod["rating"]
-    predicted_price = predict_price_lgbm(discount, rating)
-    if predicted_price is not None:
-        st.success(f"Predicted Price (LightGBM): ₹{predicted_price}")
-    else:
-        st.warning("Could not predict price for this product.")
-
-    # Show metrics and charts
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Price", f"₹{int(prod['price'])}")
-    c2.metric("Discount", f"{prod['discount']}%")
-    c3.metric("Rating", f"{prod['rating']}/5")
-    c4.metric("Source", prod["source"])
-
-    # Customer sentiment analysis
-    st.subheader("Customer Sentiment")
-    sdata = analyzer.get_sentiment_analysis(product_name)
-    if sdata:
-        # Remove 'Parsing Error' from sentiment distribution if present
-        if 'Parsing Error' in sdata['sentiment_distribution']:
-            del sdata['sentiment_distribution']['Parsing Error']
-
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            fig = px.pie(values=list(sdata["sentiment_distribution"].values()),
-                         names=list(sdata["sentiment_distribution"].keys()),
-                         title="Sentiment Distribution")
-            st.plotly_chart(fig, config={"responsive": True})
-        with col2:
-            st.metric("Total Reviews", sdata["total_reviews"])
-            st.metric("Avg Sentiment Score", f"{sdata['average_sentiment_score']:.2f}")
-
-        st.markdown("### Recent Reviews")
-        for _, r in sdata["reviews_data"].head(5).iterrows():
-            sent = r["sentiment"]
-            sc = r.get("sentiment_score", 0)
-            with st.expander(f"{r['userid']} - Rating: {r['rating']}"):
-                st.write(r["review_text"])
-                st.write(f"Sentiment: {sent} (score {sc:.2f})")
-    else:
-        st.info("No reviews available.")
-
-    # Show product table at the bottom
-    st.markdown("### Product Details Table")
-    st.dataframe(df, width='stretch')
-
-    # ...existing code...
-
-def competitor_comparison(analyzer, product_name):
-    """Compare product with competitors in same source and nearby price range."""
-    st.markdown('<div class="section-header">Competitor Comparison</div>', unsafe_allow_html=True)
-
-    source = analyzer.products_df.query("product_name==@product_name")["source"].iloc[0]
-    comp = analyzer.products_df.query("source==@source and product_name!=@product_name")
-    if comp.empty:
-        st.info("No competitor data available.")
-        return
-
-    # Competitor price comparison chart
-    fig = px.bar(comp, x="product_name", y="price", color="price",
-                 title=f"Competitor Price Comparison ({source})")
-    st.plotly_chart(fig, config={"responsive": True})
-
-    # Competitor table
-    st.dataframe(comp[["product_name", "price", "discount", "rating", "url"]])
-
-    # Use sidebar-selected product for nearby comparison
-    selected_product = product_name
-    selected_price = analyzer.products_df.query("product_name==@selected_product")["price"].values[0]
-    st.markdown(f"Showing products around ₹{selected_price}")
-
-    lower_bound, upper_bound = selected_price * 0.8, selected_price * 1.2
-    nearby_products = analyzer.products_df.query(
-        "price >= @lower_bound and price <= @upper_bound"
-    ).copy()
-
-    sentiment_scores = []
-    for prod in nearby_products["product_name"]:
-        sentiment_info = analyzer.get_sentiment_analysis(prod)
-        sentiment_scores.append(sentiment_info["average_sentiment_score"] if sentiment_info else np.nan)
-    nearby_products["avg_sentiment"] = sentiment_scores
-    nearby_products.sort_values(by="avg_sentiment", ascending=False, inplace=True)
-
-    cols = ["product_name", "source", "price", "discount", "rating", "avg_sentiment", "url"]
-    st.dataframe(nearby_products[cols])
-
-    same_product_sources = analyzer.products_df.query("product_name==@selected_product")
-    st.markdown(f"'{selected_product}' Price & Discount Across Sources:")
-    st.dataframe(same_product_sources[["source", "price", "discount", "rating", "url"]])
-
-
-def strategic_recommendations(analyzer, product_name):
-    """Generate pricing, discount, sentiment, and review-based strategy suggestions."""
-    st.markdown('<div class="section-header">Strategic Recommendations</div>', unsafe_allow_html=True)
-
-    prod = analyzer.products_df.query("product_name==@product_name").iloc[0]
-    sdata = analyzer.get_sentiment_analysis(product_name)
-    avg_score = sdata["average_sentiment_score"] if sdata else 0
-    total_reviews = sdata["total_reviews"] if sdata else 0
-
-    strategy_lines = []
-
-    if prod["price"] > 50000:
-        strategy_lines.append(f"- High price (₹{prod['price']}). Consider limited-time discounts or EMI options.")
-    elif prod["price"] < 20000:
-        strategy_lines.append(f"- Competitive price (₹{prod['price']}) can be marketed aggressively.")
-
-    if prod["discount"] < 5:
-        strategy_lines.append(f"- Low discount ({prod['discount']}%). Increase for better customer pull.")
-    elif prod["discount"] > 20:
-        strategy_lines.append(f"- High discount ({prod['discount']}%). Maintain during campaigns.")
-
-    if avg_score < 0:
-        strategy_lines.append("- Negative sentiment detected. Investigate recurring complaints.")
-    elif avg_score < 0.2:
-        strategy_lines.append("- Neutral sentiment. Enhance product features or promotions.")
-    else:
-        strategy_lines.append("- Positive sentiment! Highlight strengths in campaigns.")
-
-    if total_reviews < 10:
-        strategy_lines.append("- Very few reviews. Encourage customers to share feedback.")
-    elif total_reviews > 100:
-        strategy_lines.append("- High review volume. Mine insights for product improvements.")
-
-    sentiment_status = "Needs Improvement" if avg_score < 0.2 else "Good" if avg_score < 0.5 else "Excellent"
-    sentiment_class = "negative-sentiment" if avg_score < 0.2 else "neutral-sentiment" if avg_score < 0.5 else "positive-sentiment"
-
-    st.markdown(
-        f"Sentiment Status: <span class='{sentiment_class}'>{sentiment_status}</span>",
-        unsafe_allow_html=True
+    # Grouping Strategy:
+    # - Home Appliances -> Group by Appliance Category (AC, Fridge, etc.)
+    # - Gadgets / Consumer Electronics -> Group by Brand (Apple, Samsung, etc.)
+    is_appliance_view = (
+        selected_category == "home_appliances"
+        or (
+            selected_category == "all"
+            and all(
+                normalize_category(fk.get("category", "")) == "home_appliances"
+                for fk, _ in filtered_pairs
+            )
+        )
     )
 
-    st.markdown("### Recommended Strategy")
-    st.markdown("\n".join(strategy_lines))
+    if is_appliance_view:
+        appliance_groups: Dict[str, List[Tuple[pd.Series, Optional[pd.Series]]]] = {}
+        for label, _slug, _kws in _APPLIANCE_TYPE_RULES:
+            appliance_groups[label] = []
 
+        for fk_row, az_row in filtered_pairs:
+            atype = get_appliance_type(str(fk_row.get("product_name", "")))
+            appliance_groups.setdefault(atype, []).append((fk_row, az_row))
 
-def notifications_section(notifications_file="data/notifications.csv"):
-    st.info("🔔 Displaying notifications and alerts.")
-    if not os.path.exists(notifications_file) or os.path.getsize(notifications_file) == 0:
-        pd.DataFrame(columns=["timestamp", "type", "message", "hash"]).to_csv(notifications_file, index=False)
-        st.info("No notifications available.")
-        return
-    try:
-        df = pd.read_csv(notifications_file)
-        if df.empty:
-            st.info("No notifications to display.")
-            return
-        st.dataframe(df, width='stretch')
-        st.markdown("### Recent Alerts")
-        for _, row in df.tail(5).iterrows():
-            st.write(f"- **[{row['timestamp']}]** {row['message']}")
-    except pd.errors.EmptyDataError:
-        st.info("No notifications available.")
+        global_card_counter = 0
+        for atype_label, pairs in appliance_groups.items():
+            if not pairs:
+                continue
 
-# ---------------- Main App ----------------
-def main():
-    """Main entry point for Streamlit dashboard."""
+            pairs.sort(key=lambda p: (
+                canonical_brand_name(extract_brand(str(p[0].get("product_name", "")))).upper(),
+                str(p[0].get("product_name", "")).lower(),
+            ))
+            total_in_type = len(pairs)
+            st.markdown(
+                f"""
+            <div class='department-banner' style='margin-top:1.2rem;'>
+                {atype_label}
+                <span style='font-size:0.8rem; color:#8b949e; margin-left:0.5rem;'>({total_in_type} products)</span>
+            </div>""",
+                unsafe_allow_html=True,
+            )
+            cols_per_row = 3
+            for i in range(0, len(pairs), cols_per_row):
+                row_items = pairs[i: i + cols_per_row]
+                cols = st.columns(cols_per_row)
+                for c_idx, (fk_row, az_row) in enumerate(row_items):
+                    with cols[c_idx]:
+                        render_product_card(
+                            fk_row,
+                            az_row,
+                            fk_row.get("category", selected_category),
+                            card_index=global_card_counter,
+                        )
+                        global_card_counter += 1
 
-    # This block runs ONLY on the very first load of the session.
-    # It runs the pipeline, sets a flag, and then forces a fresh page load.
-    if "pipeline_initialized" not in st.session_state:
-        st.markdown('<div class="main-header">E-Commerce Competitor Strategy Dashboard</div>', unsafe_allow_html=True)
-        orchestrate_pipeline()
-        st.session_state["pipeline_initialized"] = True
-        # This is the key change: it stops the script here and re-runs it from the top.
-        st.rerun()
+    else:
+        departments: Dict[str, Dict[str, List[Tuple[pd.Series, Optional[pd.Series]]]]] = {}
+        for fk_row, az_row in filtered_pairs:
+            row_cat = fk_row.get("category", selected_category)
+            dept_name = get_department_name(row_cat)
+            b_raw = extract_brand(str(fk_row.get("product_name", "")))
+            comp_name = canonical_brand_name(b_raw)
+            departments.setdefault(dept_name, {}).setdefault(comp_name, []).append((fk_row, az_row))
 
-    # After the rerun, the code above is skipped, and this part runs.
-    # It will show the login UI on a clean page until the user is logged in.
-    import login
-    if not login.is_logged_in():
-        login.show_login_ui()
-        st.stop()
+        sorted_dept_names = sorted(departments.keys())
+        global_card_counter = 0
 
-    # This part only runs AFTER a successful login.
-    st.markdown('<div class="main-header">E-Commerce Competitor Strategy Dashboard</div>', unsafe_allow_html=True)
-    analyzer = CompetitorAnalyzer()
-    if not analyzer.load_data():
-        st.stop()
+        for dept in sorted_dept_names:
+            comp_dict = departments[dept]
+            if not is_single_category:
+                total_dept_items = sum(len(pairs) for pairs in comp_dict.values())
+                st.markdown(
+                    f"<div class='department-banner'>{dept} <span style='font-size:0.8rem; color:#8b949e;'>({total_dept_items} products)</span></div>",
+                    unsafe_allow_html=True,
+                )
 
-    section = st.sidebar.radio("Navigate", [
-        "Product Analysis",
-        "Competitor Comparison",
-        "Strategic Recommendations",
-        "Notifications"
-    ])
-    product = st.sidebar.selectbox("Select Product", analyzer.products_df["product_name"].unique())
+            for comp in sorted(comp_dict.keys(), key=lambda c: c.upper()):
+                comp_pairs = comp_dict[comp]
+                comp_pairs.sort(key=lambda p: str(p[0].get("product_name", "")).strip().lower())
 
-    if section == "Product Analysis":
-        product_analysis(analyzer, product)
-    elif section == "Competitor Comparison":
-        competitor_comparison(analyzer, product)
-    elif section == "Strategic Recommendations":
-        strategic_recommendations(analyzer, product)
-    elif section == "Notifications":
-        notifications_section()
+                st.markdown(
+                    f"""
+                <div class='brand-group-header'>
+                    <div class='brand-group-title'>🏢 {comp}</div>
+                    <div class='brand-count-badge'>{len(comp_pairs)} products</div>
+                </div>""",
+                    unsafe_allow_html=True,
+                )
+
+                cols_per_row = 3
+                for i in range(0, len(comp_pairs), cols_per_row):
+                    row_items = comp_pairs[i: i + cols_per_row]
+                    cols = st.columns(cols_per_row)
+                    for c_idx, (fk_row, az_row) in enumerate(row_items):
+                        with cols[c_idx]:
+                            render_product_card(
+                                fk_row,
+                                az_row,
+                                fk_row.get("category", selected_category),
+                                card_index=global_card_counter,
+                            )
+                            global_card_counter += 1
 
 
 if __name__ == "__main__":

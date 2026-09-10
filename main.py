@@ -1,31 +1,11 @@
-import os
-from dotenv import load_dotenv
-from groq import Groq
+"""
+main.py — Entry point for the E-Commerce Competitor Intelligence Pipeline.
 
-# Load variables from .env file
-load_dotenv(dotenv_path="env/.env")
+Delegates to pipeline.py for the full end-to-end flow.
+Run the dashboard separately with: streamlit run dashboard.py
+"""
 
-# Get API key from environment variables
-api_key = os.getenv("GROQ_API_KEY")
+import pipeline
 
-if not api_key:
-    raise ValueError("GROQ_API_KEY is missing. Check your .env file.")
-
-# Initialize Groq client
-client = Groq(api_key=api_key)
-
-chat_completion = client.chat.completions.create(
-    messages=[
-        {
-            "role": "user",
-            "content": "are u good at science",
-        },
-        {
-            "role": "system",
-            "content": "You are a e-commerce competitor analyst",
-        }
-    ],
-    model="llama-3.3-70b-versatile",
-)
-
-print(chat_completion.choices[0].message.content)
+if __name__ == "__main__":
+    pipeline.main()

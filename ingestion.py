@@ -1,17 +1,14 @@
-#ingestion.py 
+# ingestion.py — data cleaning for scraped product and review data
 
 import pandas as pd
 from datetime import datetime, timedelta
 import re
 import os
 import logging
-from textblob import TextBlob  # for sentiment analysis
-import lightgbm as lgb
-import joblib
 
 # ---------------- CONFIG ----------------
-REVIEWS_FILE = os.getenv("REVIEWS_FILE", "my_docs/review.csv")   # cleaned review input
-MOBILE_FILE = os.getenv("MOBILE_FILE", "my_docs/mobile.csv")    # scraped mobile data input
+REVIEWS_FILE = os.getenv("REVIEWS_FILE", "data/review.csv")   # cleaned review input
+MOBILE_FILE = os.getenv("MOBILE_FILE", "data/mobile.csv")    # scraped mobile data input
 OUTPUT_REVIEWS = os.getenv("OUTPUT_REVIEWS", "cleaned_reviews.csv")
 OUTPUT_MOBILE = os.getenv("OUTPUT_MOBILE", "cleaned_mobile.csv")
 DATA_DIR = os.getenv("DATA_DIR", "data")
@@ -57,7 +54,7 @@ def remove_emojis(text):
     """Remove emojis, symbols, and non-text characters from review"""
     if not isinstance(text, str):
         return text
-    return re.sub(r'[^A-Za-z0-9.,!?;:\'"()\-\s]', '', text)
+    return re.sub(r'[^A-Za-z0-9.,!?;:\'\"()\-\s]', '', text)
 
 # ---------------- CLEANING FUNCTIONS ----------------
 
@@ -87,27 +84,54 @@ def clean_mobile(df):
 
 # ---------------- MAIN ----------------
 
-def main():
+def main(category=None):
+    """Clean product and review data for a given category.
+
+    Args:
+        category: category name (e.g. 'mobiles'). If None, uses legacy
+                  paths for backward compatibility.
+    """
+    # Resolve file paths based on category
+    if category:
+        # Per-category paths (written by product.py)
+        mobile_file = os.path.join(DATA_DIR, f"{category}_products.csv")
+        reviews_file = os.path.join(DATA_DIR, f"{category}_reviews.csv")
+        output_mobile = f"cleaned_{category}.csv"
+        output_reviews = f"cleaned_{category}_reviews.csv"
+
+        # Fallback to legacy paths for 'mobiles' category
+        if category == "mobiles" and not os.path.exists(mobile_file):
+            mobile_file = MOBILE_FILE
+            reviews_file = REVIEWS_FILE
+            output_mobile = OUTPUT_MOBILE
+            output_reviews = OUTPUT_REVIEWS
+    else:
+        mobile_file = MOBILE_FILE
+        reviews_file = REVIEWS_FILE
+        output_mobile = OUTPUT_MOBILE
+        output_reviews = OUTPUT_REVIEWS
+
+    # Track valid product IDs for cross-filtering reviews
+    valid_product_ids = set()
+
     # -------- Load and Clean Mobile Data --------
-    if os.path.exists(MOBILE_FILE):
-        df_mobile = pd.read_csv(MOBILE_FILE)
+    if os.path.exists(mobile_file):
+        df_mobile = pd.read_csv(mobile_file)
         logging.info(f"Raw mobile data: {len(df_mobile)} rows")
         df_mobile_clean = clean_mobile(df_mobile)
         valid_product_ids = set(df_mobile_clean['productid'].dropna().unique())
         logging.info(f"Cleaned mobile data: {len(df_mobile_clean)} rows")
-        df_mobile_clean.to_csv(os.path.join(DATA_DIR, OUTPUT_MOBILE), index=False, encoding="utf-8-sig")
-        logging.info(f"✅ Cleaned mobile data saved: {DATA_DIR}/{OUTPUT_MOBILE}")
-
-        train_price_model_lgbm(df_mobile_clean)
+        df_mobile_clean.to_csv(os.path.join(DATA_DIR, output_mobile), index=False, encoding="utf-8-sig")
+        logging.info(f"✅ Cleaned mobile data saved: {DATA_DIR}/{output_mobile}")
     else:
-        logging.warning(f"Mobile file not found: {MOBILE_FILE}")
+        logging.warning(f"Mobile file not found: {mobile_file}")
 
     # -------- Load and Clean Reviews --------
-    if os.path.exists(REVIEWS_FILE):
-        df_reviews = pd.read_csv(REVIEWS_FILE)
+    if os.path.exists(reviews_file):
+        df_reviews = pd.read_csv(reviews_file)
         logging.info(f"Raw reviews: {len(df_reviews)} rows")
 
-        # ✅ Filter only reviews whose productid exists in mobiles.csv
+        # Filter only reviews whose productid exists in mobiles.csv
         if valid_product_ids:
             before = len(df_reviews)
             df_reviews = df_reviews[df_reviews['productid'].isin(valid_product_ids)]
@@ -115,28 +139,13 @@ def main():
 
         df_reviews_clean = clean_reviews(df_reviews)
         logging.info(f"Cleaned reviews: {len(df_reviews_clean)} rows")
-        df_reviews_clean.to_csv(os.path.join(DATA_DIR, OUTPUT_REVIEWS), index=False, encoding="utf-8-sig")
-        logging.info(f"✅ Cleaned reviews saved: {DATA_DIR}/{OUTPUT_REVIEWS}")
+        df_reviews_clean.to_csv(os.path.join(DATA_DIR, output_reviews), index=False, encoding="utf-8-sig")
+        logging.info(f"✅ Cleaned reviews saved: {DATA_DIR}/{output_reviews}")
     else:
-        logging.warning(f"Reviews file not found: {REVIEWS_FILE}")
-
-def train_price_model_lgbm(mobile_df):
-    features = ["discountoffering", "rating"]
-    # Ensure columns exist and are numeric
-    for col in features:
-        if col not in mobile_df.columns:
-            logging.warning(f"Missing column for ML: {col}")
-            return
-    mobile_df = mobile_df.dropna(subset=["sellingprice", "discountoffering", "rating"])
-    if len(mobile_df) < 10:
-        logging.warning("Not enough data to train LightGBM model.")
-        return
-    X = mobile_df[features]
-    y = mobile_df["sellingprice"]
-    model = lgb.LGBMRegressor(n_estimators=100, random_state=42)
-    model.fit(X, y)
-    joblib.dump(model, "data/price_predictor_lgbm.joblib")
-    logging.info("✅ LightGBM price prediction model trained and saved.")
+        logging.info(f"No raw reviews file ({reviews_file}) — creating empty {output_reviews}")
+        df_reviews_clean = pd.DataFrame(columns=['productid', 'userid', 'review', 'rating', 'reviewdate'])
+        df_reviews_clean.to_csv(os.path.join(DATA_DIR, output_reviews), index=False, encoding="utf-8-sig")
+        logging.info(f"✅ Cleaned reviews saved: {DATA_DIR}/{output_reviews}")
 
 if __name__ == "__main__":
     main()

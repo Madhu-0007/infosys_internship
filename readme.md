@@ -89,14 +89,8 @@ infosys_internship/
 │       ├── price_feed.py                # Chronological price drop feed expander
 │       ├── product_card.py              # Visual product cards with winner badges & links
 │       └── detail_view.py               # Asset inspection view with Arbitrage Calculator
-├── tests/                               # Comprehensive unit test suite
-│   ├── __init__.py
-│   ├── test_models.py                   # Tests for dataclass calculations & arbitrage edge
-│   ├── test_appliances.py               # Tests for AC, Fridge, Washer & spec extraction
-│   ├── test_brands.py                   # Tests for canonical casing & normalization
-│   ├── test_analytics.py                # Tests for Holt-Winters, MAPE, and search query engine
-│   └── run_all_tests.py                 # Test runner script
 ├── config/
+
 │   ├── __init__.py
 │   └── categories.py                    # Per-category scraping config
 ├── data/
@@ -183,15 +177,8 @@ python pipeline.py --all                # all categories
 2. Add the slug to `ALL_SUPPORTED_CATEGORIES` in `dashboard.py`.
 3. Restart the dashboard.
 
-### Run unit tests
-
-```bash
-python tests/run_all_tests.py
-# or with unittest discovery:
-python -m unittest discover -s tests -p "test_*.py"
-```
-
 ---
+
 
 
 ## 🏠 Home Appliances: Item Category Drill-Down & Grouping

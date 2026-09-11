@@ -1,12 +1,28 @@
-/env
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
 .venv/
 venv/
-__pycache__/
-*.pyc
-*.pyo
+env/
+ENV/
+
+# Environment variables & local secrets
 .env
+env/.env
+
+# ML Model artifacts & logs
 *.joblib
 notifier.log
-powershell.cmd
-.refactor_backup/
 
+# Temporary & backup files
+.refactor_backup/
+.baseline_*
+*.bak
+*.tmp
+
+# OS generated files
+.DS_Store
+Thumbs.db

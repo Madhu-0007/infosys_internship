@@ -5,7 +5,6 @@ Flipkart vs Amazon Direct Intelligence Engine.
 Refactored Architecture:
 - core/ : Pure business logic, typed domain models, Holt-Winters forecasting, sentiment extraction, and data loaders.
 - ui/   : High-performance terminal styles, Plotly charts, topbars, KPI cards, product cards, and detail views.
-- tests/: Comprehensive unit test suite with high coverage across models, classification, and forecasting.
 """
 import datetime
 import logging
@@ -74,6 +73,8 @@ def _run_startup_audit():
 
 reset_and_initialize_price_history()
 _run_startup_audit()
+
+
 
 
 
